@@ -78,8 +78,45 @@ export class MobileApi {
   private pendingCodeVerifier?: string;
   private oidc?: OidcDiscovery;
 
+  /** Refresh this long before `exp`, so no request goes out with an expired bearer. */
+  private static readonly REFRESH_SKEW_MS = 60_000;
+  private refreshInFlight?: Promise<boolean>;
+  private lastRefreshError?: string;
+
+  /** `exp` of the loaded access token (ms since epoch); undefined when absent or not a JWT. */
+  get tokenExpiresAtMs(): number | undefined {
+    return jwtExpiryMs(this.accessToken);
+  }
+
+  /** True only when an access token is loaded AND not past its `exp`. Alza answers an
+   * expired bearer with HTTP 200 as an anonymous visitor (user_id -1), never 401, so
+   * token presence alone says nothing about being signed in. */
   get isAuthenticated(): boolean {
+    if (!this.accessToken) return false;
+    const exp = this.tokenExpiresAtMs;
+    return exp === undefined || exp > Date.now();
+  }
+
+  get hasAccessToken(): boolean {
     return Boolean(this.accessToken);
+  }
+
+  get canRefresh(): boolean {
+    return Boolean(this.refreshToken);
+  }
+
+  /** Reason the last refresh attempt failed; cleared on a successful refresh or sign-in. */
+  get refreshError(): string | undefined {
+    return this.lastRefreshError;
+  }
+
+  /** Refresh proactively when the access token is expired or within REFRESH_SKEW_MS of `exp`.
+   * Relying on 401 does not work: Alza silently downgrades an expired bearer to anonymous. */
+  async ensureFreshToken(): Promise<void> {
+    if (!this.accessToken || !this.refreshToken) return;
+    const exp = this.tokenExpiresAtMs;
+    if (exp === undefined || exp - Date.now() > MobileApi.REFRESH_SKEW_MS) return;
+    await this.refreshAccessToken();
   }
 
   constructor(opts: MobileApiOptions = {}) {
@@ -212,18 +249,31 @@ export class MobileApi {
     this.refreshToken = json.refresh_token;
     this.pendingOAuth = undefined;
     this.pendingCodeVerifier = undefined;
+    this.lastRefreshError = undefined;
     this.persistTokens();
     return { authenticated: true, expiresIn: json.expires_in };
   }
 
+  /** Single-flight: concurrent callers share one refresh, so a rotating refresh token is
+   * never spent twice. */
   async refreshAccessToken(): Promise<boolean> {
+    this.refreshInFlight ??= this.doRefresh().finally(() => {
+      this.refreshInFlight = undefined;
+    });
+    return this.refreshInFlight;
+  }
+
+  private async doRefresh(): Promise<boolean> {
     // Another session may already have rotated the refresh token; prefer the persisted one.
     const stored = this.readStoredTokens();
     if (stored?.refresh_token && stored.refresh_token !== this.refreshToken) {
       this.refreshToken = stored.refresh_token;
       if (stored.access_token) this.accessToken = stored.access_token;
     }
-    if (!this.refreshToken) return false;
+    if (!this.refreshToken) {
+      this.lastRefreshError = "no refresh token loaded";
+      return false;
+    }
     const discovery = await this.discovery();
     const tokenEndpoint = discovery.token_endpoint ?? "https://identity.alza.cz/connect/token";
     const body = new URLSearchParams({
@@ -233,17 +283,33 @@ export class MobileApi {
       ...(MobileApi.clientSecret() ? { client_secret: MobileApi.clientSecret()! } : {}),
     });
     const res = await this.identityRequest(tokenEndpoint, { method: "POST", headers: Object.fromEntries(this.mobileHeaders({ "content-type": "application/x-www-form-urlencoded", accept: "application/json" }).entries()), body: body.toString() });
-    if (res.status < 200 || res.status >= 300) return false;
+    if (res.status < 200 || res.status >= 300) {
+      let reason = "";
+      try { reason = String((JSON.parse(res.text) as { error?: unknown }).error ?? ""); } catch { /* non-JSON body */ }
+      this.lastRefreshError = `token endpoint HTTP ${res.status}${reason ? ` (${reason})` : ""}`;
+      log.warn("token refresh failed", { status: res.status, error: reason || undefined });
+      return false;
+    }
     let json: { access_token?: string; refresh_token?: string };
-    try { json = JSON.parse(res.text); } catch { return false; }
-    if (!json.access_token) return false;
+    try { json = JSON.parse(res.text); } catch {
+      this.lastRefreshError = "token endpoint returned non-JSON";
+      return false;
+    }
+    if (!json.access_token) {
+      this.lastRefreshError = "token endpoint returned no access_token";
+      return false;
+    }
     this.accessToken = json.access_token;
     this.refreshToken = json.refresh_token ?? this.refreshToken;
+    this.lastRefreshError = undefined;
     this.persistTokens();
+    const exp = this.tokenExpiresAtMs;
+    log.info("token refreshed", { expiresAt: exp !== undefined ? new Date(exp).toISOString() : undefined });
     return true;
   }
 
   async request<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
+    await this.ensureFreshToken();
     // Absolute URLs (cross-host families like chatbotapi.alza.cz, row W18) bypass the base.
     const url = /^https?:\/\//.test(path) ? path : `${this.baseUrl}${path}`;
     const method = init.method ?? "GET";
@@ -358,6 +424,7 @@ export class MobileApi {
   }
 
   async executeAppAction(action: ServerAppAction, options: ExecuteAppActionOptions = {}): Promise<unknown> {
+    await this.ensureFreshToken();
     const executor = new AppActionExecutor({ baseUrl: this.baseUrl, visitorId: this.visitorId, userId: this.userId, authorizationToken: this.accessToken, fetchImpl: this.fetchImpl });
     return executor.execute(action, options);
   }
@@ -808,6 +875,7 @@ export class MobileApi {
       throw new Error(`document host is not an allowed Alza origin: ${u.hostname} (allowed: ${[...MobileApi.DOCUMENT_HOSTS].join(", ")})`);
     }
     const MAX_BYTES = 8 * 1024 * 1024;
+    await this.ensureFreshToken();
     const headers: Record<string, string> = {
       accept: "application/pdf, application/json, application/xml, text/plain, application/octet-stream",
       "user-agent": "Alza/2026.17.0 (Android)",
@@ -913,4 +981,19 @@ function summarize(value: unknown): string {
 
 function base64Url(value: Buffer): string {
   return value.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+/** `exp` claim of a JWT in ms since epoch. No signature check: used only to schedule
+ * refreshes and report status, never to trust identity. */
+export function jwtExpiryMs(token: string | undefined): number | undefined {
+  if (!token) return undefined;
+  const parts = token.split(".");
+  const payload = parts[1];
+  if (parts.length !== 3 || !payload) return undefined;
+  try {
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { exp?: unknown };
+    return typeof claims.exp === "number" && Number.isFinite(claims.exp) ? claims.exp * 1000 : undefined;
+  } catch {
+    return undefined;
+  }
 }

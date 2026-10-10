@@ -239,12 +239,39 @@ export class MobileAccount {
     }
   }
 
-  status(): { authenticated: boolean; visitorId: string; apiBaseUrl: string } {
-    return { authenticated: this.api.isAuthenticated, visitorId: this.api.visitorId, apiBaseUrl: this.api.baseUrl };
+  status(): AccountStatus {
+    const exp = this.api.tokenExpiresAtMs;
+    return {
+      authenticated: this.api.isAuthenticated,
+      visitorId: this.api.visitorId,
+      apiBaseUrl: this.api.baseUrl,
+      tokenLoaded: this.api.hasAccessToken,
+      ...(exp !== undefined ? { tokenExpiresAt: new Date(exp).toISOString(), tokenExpired: exp <= Date.now() } : {}),
+      canRefresh: this.api.canRefresh,
+      ...(this.api.refreshError ? { lastRefreshError: this.api.refreshError } : {}),
+    };
+  }
+
+  /** Run an account call and verify Alza bound it to the signed-in user. An expired or
+   * rejected bearer is answered with HTTP 200 as an anonymous visitor (`user_id: -1`), so
+   * on that shape refresh once and retry, then fail loudly instead of returning anonymous
+   * data. ALZA_ALLOW_ANONYMOUS=true restores the upstream fall-through. */
+  private async bound<T>(op: string, run: () => Promise<T>): Promise<T> {
+    let res = await run();
+    if (!isAnonymous(res)) return res;
+    if (await this.api.refreshAccessToken()) {
+      res = await run();
+      if (!isAnonymous(res)) return res;
+    }
+    if (/^(1|true|yes)$/i.test(process.env.ALZA_ALLOW_ANONYMOUS ?? "")) return res;
+    const why = !this.api.hasAccessToken
+      ? "No access token is loaded."
+      : `Token refresh failed${this.api.refreshError ? ` (${this.api.refreshError})` : ""}.`;
+    throw new Error(`${op}: Alza answered as an anonymous visitor (user_id -1), so this would not reach your account. ${why} Run auth_start, sign in, then auth_exchange.`);
   }
 
   /** Typed user-management reads (profile/address book, contacts). */
-  async profile(): Promise<unknown> { return this.api.userData(); }
+  async profile(): Promise<unknown> { return this.bound("profile", () => this.api.userData()); }
   async contacts(): Promise<unknown> { return this.api.contacts(); }
 
   /** Registration (APK `Register` DTO) — high-impact, one-time token. */
@@ -836,11 +863,14 @@ export class MobileAccount {
   }
 
   async cart(): Promise<unknown> {
-    return { info: await this.api.cartInfo(), items: await this.api.cart() };
+    const info = await this.bound("cart", () => this.api.cartInfo());
+    return { info, items: await this.api.cart() };
   }
 
   async addToCart(code: string, quantity = 1): Promise<unknown> {
     if (quantity < 1 || quantity > 99) throw new Error("quantity must be between 1 and 99");
+    // Probe the binding with a read first: the add itself must never run twice or anonymously.
+    await this.bound("add_to_cart", () => this.api.cartInfo());
     return this.api.addByCode(code, quantity);
   }
 
@@ -864,4 +894,25 @@ export class MobileAccount {
     this.pending = undefined;
     return { selectedDeliveryPayment: selected, userInfoResult: user, approval: approved, orderFinished: finished };
   }
+}
+
+export interface AccountStatus {
+  /** A non-expired access token is loaded. */
+  authenticated: boolean;
+  visitorId: string;
+  apiBaseUrl: string;
+  /** Any access token is loaded, expired or not. */
+  tokenLoaded: boolean;
+  /** Access-token `exp` (ISO 8601), when the token is a JWT. */
+  tokenExpiresAt?: string;
+  tokenExpired?: boolean;
+  /** A refresh token is loaded, so an expired access token is renewed on the next account call. */
+  canRefresh: boolean;
+  /** Why the last refresh failed, if it did. */
+  lastRefreshError?: string;
+}
+
+/** Alza's anonymous-visitor shape: a top-level `user_id` of -1. */
+function isAnonymous(res: unknown): boolean {
+  return typeof res === "object" && res !== null && Number((res as Record<string, unknown>).user_id) === -1;
 }

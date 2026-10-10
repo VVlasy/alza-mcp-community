@@ -49,7 +49,7 @@ export function createAdvancedTools(deps: ToolDeps): RegisterableTool[] {
             "Read the authenticated user's Alza profile: personal data, the delivery-address book with per-address HATEOAS actions (create/edit/delete/search), and account sections. " +
             "Use to inspect the account, to confirm the account binding (`user_id`, email), and to obtain the `action` objects required by `address_upsert`, `address_delete`, `address_search`, `complaint_claims`, and the subscription tools. " +
             AUTH_PREREQ +
-            " Read-only. Honest caveat: with a stale or missing token the API may still answer HTTP 200 with an anonymous shape (`user_id: -1`, null email) — treat `user_id` as the binding signal, and refresh the token via `auth_start`/`auth_exchange` if it is -1.",
+            " Read-only. Alza answers a stale or missing token with HTTP 200 and an anonymous shape (`user_id: -1`); the server refreshes the token once on that shape and otherwise returns an error telling you to re-run `auth_start`/`auth_exchange`.",
           inputSchema: {},
           annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: true },
           outputSchema: OUTPUT_SCHEMAS["profile"],

@@ -194,9 +194,9 @@ export function createAccountTools(deps: ToolDeps): RegisterableTool[] {
         {
           title: "Check mobile API auth status",
           description:
-            "Report whether a mobile API access token is loaded in this server process. " +
+            "Report the mobile API token state in this server process: `authenticated` (a non-expired access token is loaded), `tokenLoaded`, `tokenExpiresAt`/`tokenExpired`, `canRefresh` (an expired token is renewed automatically on the next account call) and `lastRefreshError`. " +
             "Use as a first check before account-scoped tools (`cart`, `profile`, `order`, `add_to_cart`), or to diagnose \"not authenticated\" failures. " +
-            "If no token is loaded, run `auth_start`, have the user complete the browser sign-in, then `auth_exchange`. " +
+            "If `authenticated` is false and `canRefresh` is false, or `lastRefreshError` is set, run `auth_start`, have the user complete the browser sign-in, then `auth_exchange`. " +
             "Read-only; no network call.",
           inputSchema: {},
           annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
@@ -238,8 +238,8 @@ export function createAccountTools(deps: ToolDeps): RegisterableTool[] {
             "Use when the user wants a product put into their Alza account; pass `quantity` (default 1, max 99). " +
             "Side effect: mutates the cart — the item stays there until removed or ordered (there is no basket-remove tool). " +
             "Do not use for the separate HATEOAS web checkout cart — that is `web_add_to_cart` (does not share state with this tool; see its description). " +
-            "LIVE NOTE (2026-09-26): despite the usual auth prerequisite, this call also succeeds with no OAuth token loaded — it falls back to an anonymous, visitor-keyed (Balancer-Guid) WCF cart (`account_status` still reports `authenticated: true` but `user_id: -1`). " +
-            "That anonymous cart is exactly what `delivery_options` + `web_place_order` need for the working (non-500) anonymous order pipeline — do NOT use `checkout_preview`/`place_order` for anonymous checkout, their `sendOrder3` step 500s unconditionally (docs/gap-analysis.md G1/G5). " +
+            "Binding guard: before adding, the server checks the cart is bound to the signed-in user; Alza answers an expired or missing token with an anonymous visitor cart (`user_id: -1`), so the server refreshes the token once and, if still anonymous, fails with an error instead of adding to an anonymous cart. " +
+            "Set ALZA_ALLOW_ANONYMOUS=true on the server to allow the anonymous, visitor-keyed (Balancer-Guid) cart that `delivery_options` + `web_place_order` use (docs/gap-analysis.md G1/G5). " +
             AUTH_PREREQ + " The response echoes the added line and the new basket count; verify with `cart` if in doubt. Example: `add_to_cart({code: \"RI054b1\", quantity: 1})`.",
           inputSchema: {
             code: z.string().min(1).describe("Alza product code, e.g. 'RI054b1' (the `code` field from `search_products`)."),

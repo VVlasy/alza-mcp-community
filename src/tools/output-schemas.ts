@@ -72,12 +72,21 @@ export const PREPARE_MUTATION = z
 /** `account_status` result — local process state, no network call. */
 export const ACCOUNT_STATUS = z
   .object({
-    /** Whether a mobile API access token is loaded in this process. */
+    /** A non-expired mobile API access token is loaded in this process. */
     authenticated: z.boolean(),
     /** Alza visitor id (empty when unauthenticated). */
     visitorId: z.string(),
     /** Mobile API base URL in use. */
     apiBaseUrl: z.string(),
+    /** Any access token is loaded, expired or not. */
+    tokenLoaded: z.boolean(),
+    /** Access-token `exp` as ISO 8601, when the token is a JWT. */
+    tokenExpiresAt: z.string().optional(),
+    tokenExpired: z.boolean().optional(),
+    /** A refresh token is loaded. */
+    canRefresh: z.boolean(),
+    /** Why the last token refresh failed. */
+    lastRefreshError: z.string().optional(),
   })
   .passthrough();
 
