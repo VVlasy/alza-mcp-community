@@ -465,6 +465,26 @@ export class MobileAccount {
     }
     const out = await this.api.downloadDocument(href);
     const name = typeof document.name === "string" ? document.name : null;
+    // ALZA_PDF_MODE=text: return extracted PDF text instead of a multi-hundred-KB base64 blob,
+    // which a chat model cannot use. `href` stays in the result for clients that fetch the file themselves.
+    if ((process.env.ALZA_PDF_MODE ?? "base64").toLowerCase() === "text" && out.base64) {
+      const bytes = Buffer.from(out.base64, "base64");
+      if (bytes.subarray(0, 5).toString("latin1") === "%PDF-") {
+        const { extractText, getDocumentProxy } = await import("unpdf");
+        const pdf = await getDocumentProxy(new Uint8Array(bytes));
+        const { totalPages, text } = await extractText(pdf, { mergePages: true });
+        const MAX_CHARS = 20_000;
+        const pdfText = text.replace(/[ \t]+\n/g, "\n").trim();
+        return {
+          name,
+          ...out,
+          base64: null,
+          pdfPages: totalPages,
+          pdfText: pdfText.slice(0, MAX_CHARS),
+          pdfTextTruncated: pdfText.length > MAX_CHARS,
+        };
+      }
+    }
     return { name, ...out };
   }
 

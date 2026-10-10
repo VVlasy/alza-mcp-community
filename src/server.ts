@@ -17,7 +17,7 @@ import { createListCategoryFiltersTool } from "./tools/list-category-filters.js"
 import { createSearchProductsTool } from "./tools/search-products.js";
 import { createAccountTools } from "./tools/account.js";
 import { createAdvancedTools } from "./tools/advanced.js";
-import { registerToolsets } from "./tools/toolsets.js";
+import { registerToolsets, type ToolsetPolicy } from "./tools/toolsets.js";
 import { MobileApi } from "./infra/mobile-api.js";
 import { ImpersonateTransport, cfFetch } from "./infra/impersonate-transport.js";
 import type { ToolResult } from "./tools/types.js";
@@ -27,6 +27,7 @@ const VERSION = "0.3.1";
 export interface BuildOptions {
   baseUrl?: string;
   cdpUrl?: string;
+  toolsets?: ToolsetPolicy;
 }
 
 export interface BuildResult {
@@ -71,7 +72,12 @@ export function buildServer(opts: BuildOptions = {}): BuildResult {
         "Account & checkout (enable `basket_and_checkout`; OAuth token auto-loads from ~/.alza-mcp/tokens.json; check `account_status`): `cart`, `add_to_cart`, `delivery_options`, `select_pickup_point`, `checkout_preview` → `place_order` (mobile API), or the legacy web WCF path `web_add_to_cart` → `web_cart` → `web_pickup_places` → `web_place_order`. " +
         "Order submission currently works via the legacy web WCF path (`web_place_order`); the mobile `place_order` (sendOrder3) returns HTTP 500 (docs/gap-analysis.md G1/G5). Cancel with `cancel_order`. " +
         "Credentials are never collected by the MCP. High-impact mutations (payment, registration, address, review, subscription, attachment, order) require a one-time token from `prepare_mutation` (in the always-on `auth` toolset) — confirm with the user before calling them. " +
-        "`mobile_read` (toolset `advanced_raw`) is the raw read-only escape hatch for mobile API operations without a dedicated tool.",
+        "`mobile_read` (toolset `advanced_raw`) is the raw read-only escape hatch for mobile API operations without a dedicated tool." +
+        (opts.toolsets?.tools
+          ? ` NOTE: this deployment exposes only these tools: ${opts.toolsets.tools.join(", ")}. Ordering, payment and account-management tools are not available; \`set_toolset\` is disabled.`
+          : opts.toolsets?.locked
+            ? ` NOTE: this deployment is locked to toolsets [${(opts.toolsets.enabled ?? ["catalog", "auth"]).join(", ")}]; other toolsets and \`set_toolset\` are unavailable.`
+            : ""),
     }
   );
 
@@ -94,7 +100,7 @@ export function buildServer(opts: BuildOptions = {}): BuildResult {
     createListCategoriesTool(deps),
     ...createAccountTools(deps),
     ...createAdvancedTools(deps),
-  ]);
+  ], opts.toolsets);
 
   const productResource = createProductResource(catalog);
   server.registerResource(

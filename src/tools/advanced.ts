@@ -661,6 +661,7 @@ export function createAdvancedTools(deps: ToolDeps): RegisterableTool[] {
             "Download an order invoice or document (row OR10) by following the server-provided `self.href` of a `Document`/`Attachment` object copied verbatim from a prior MCP response (e.g. the `documents[]` entries of `order_search` results or an order detail). " +
             "The href is origin-validated to Alza's host family (invoices serve from `pdf.alza.cz`) — no arbitrary URLs. " +
             "Returns the content as UTF-8 `text` (JSON/XML/text) or `base64` (PDF/binary), with `contentType` and `byteLength` (max 8 MiB). " +
+            "When the server runs with ALZA_PDF_MODE=text, PDFs come back as extracted `pdfText` (plus `pdfPages`) instead of base64; `href` is always returned so another tool can fetch and attach the original file. " +
             "Read-only; no token required. " +
             "Example: `order_document({document: {name: 'Faktura', self: {href: 'https://pdf.alza.cz/Apps/pdfdoc.asp?d=…'}}})`.",
           inputSchema: {

@@ -1,7 +1,7 @@
 import { randomBytes, createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Page } from "playwright";
 import { AppActionExecutor, type ExecuteAppActionOptions, type FetchLike, type ServerAppAction } from "./app-action.js";
 import { log } from "./logger.js";
@@ -97,20 +97,66 @@ export class MobileApi {
 
   /** Read an OAuth token stored by `scripts/alza-auth-login*` (ALZA_TOKEN_FILE, default ~/.alza-mcp/tokens.json).
    * Set ALZA_TOKEN_FILE=none to opt out. */
-  private readStoredTokens(): { access_token?: string; refresh_token?: string; visitor_id?: string } | undefined {
+  private static tokenFile(): string | undefined {
     if (process.env.ALZA_TOKEN_FILE === "none") return undefined;
-    const file = process.env.ALZA_TOKEN_FILE ?? join(homedir(), ".alza-mcp", "tokens.json");
+    return process.env.ALZA_TOKEN_FILE ?? join(homedir(), ".alza-mcp", "tokens.json");
+  }
+
+  /** Persist the current token set (atomic write, mode 0600) so other sessions and restarts reuse it.
+   * Only active when ALZA_PERSIST_TOKENS=true; upstream behaviour (in-memory only) is the default. */
+  private persistTokens(): void {
+    if (!/^(1|true|yes)$/i.test(process.env.ALZA_PERSIST_TOKENS ?? "")) return;
+    const file = MobileApi.tokenFile();
+    if (!file) return;
+    try {
+      mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+      const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ access_token: this.accessToken, refresh_token: this.refreshToken, visitor_id: this.visitorId, saved_at: new Date().toISOString() }), { mode: 0o600 });
+      renameSync(tmp, file);
+    } catch (err) {
+      log.warn("token persist failed", { error: (err as Error).message });
+    }
+  }
+
+  private readStoredTokens(): { access_token?: string; refresh_token?: string; visitor_id?: string } | undefined {
+    const file = MobileApi.tokenFile();
+    if (!file) return undefined;
     try {
       return JSON.parse(readFileSync(file, "utf8")) as { access_token?: string; refresh_token?: string; visitor_id?: string };
     } catch { return undefined; /* no readable token store — remain unauthenticated */ }
   }
 
+  /** Request to the Alza identity server. Plain fetch first; on a Cloudflare challenge (HTTP 403)
+   * retry from inside a real browser page on the identity origin, which clears the challenge and
+   * then issues the same request same-origin with the clearance cookie. */
+  private async identityRequest(url: string, init: { method: "GET" | "POST"; headers: Record<string, string>; body?: string }): Promise<{ status: number; text: string }> {
+    const plain = await fetch(url, { method: init.method, headers: init.headers, body: init.body });
+    const plainText = await plain.text();
+    if (plain.status !== 403 || !this.browser) return { status: plain.status, text: plainText };
+    log.info("identity request challenged; retrying via browser", { host: new URL(url).host, path: new URL(url).pathname });
+    const origin = new URL(url).origin;
+    return this.browser.withPage(async (page) => {
+      await page.goto(`${origin}/.well-known/openid-configuration`, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      for (let i = 0; i < 12; i++) {
+        const body = await page.evaluate(() => (globalThis as unknown as { document?: { body?: { innerText?: string } } }).document?.body?.innerText ?? "");
+        if (body.trim().startsWith("{")) break;
+        await page.waitForTimeout(2_500);
+      }
+      // Browser-controlled headers (user-agent, cookies) are not overridable from fetch; drop them.
+      const headers = Object.fromEntries(Object.entries(init.headers).filter(([k]) => !["user-agent", "cookie"].includes(k.toLowerCase())));
+      return page.evaluate(async ({ u, method, headers, body }) => {
+        const r = await fetch(u, { method, headers, body, credentials: "include" });
+        return { status: r.status, text: await r.text() };
+      }, { u: url, method: init.method, headers, body: init.body });
+    });
+  }
+
   async discovery(): Promise<OidcDiscovery> {
     if (this.oidc) return this.oidc;
     const authority = process.env.ALZA_OAUTH_AUTHORITY ?? "https://identity.alza.cz";
-    const response = await fetch(`${authority}/.well-known/openid-configuration`, { headers: { accept: "application/json", "user-agent": "Alza/2026.15.0 (Android)", "accept-language": "cs-CZ,cs;q=0.9,en;q=0.8", "x-correlation-id": randomUUID(), "Balancer-Guid": this.visitorId } });
-    if (!response.ok) throw new Error(`OAuth discovery failed with HTTP ${response.status}`);
-    this.oidc = await response.json() as OidcDiscovery;
+    const response = await this.identityRequest(`${authority}/.well-known/openid-configuration`, { method: "GET", headers: { accept: "application/json", "user-agent": "Alza/2026.15.0 (Android)", "accept-language": "cs-CZ,cs;q=0.9,en;q=0.8", "x-correlation-id": randomUUID(), "Balancer-Guid": this.visitorId } });
+    if (response.status < 200 || response.status >= 300) throw new Error(`OAuth discovery failed with HTTP ${response.status}`);
+    this.oidc = JSON.parse(response.text) as OidcDiscovery;
     return this.oidc;
   }
 
@@ -158,18 +204,25 @@ export class MobileApi {
     const tokenEndpoint = discovery.token_endpoint ?? "https://identity.alza.cz/connect/token";
     const secret = MobileApi.clientSecret();
     const body = new URLSearchParams({ grant_type: "authorization_code", client_id: process.env.ALZA_OAUTH_CLIENT_ID ?? "alza_Android", code, redirect_uri: process.env.ALZA_OAUTH_REDIRECT_URI ?? "alza://identity", code_verifier: verifier, ...(secret ? { client_secret: secret } : {}) });
-    const res = await fetch(tokenEndpoint, { method: "POST", headers: this.mobileHeaders({ "content-type": "application/x-www-form-urlencoded", accept: "application/json" }), body });
-    if (!res.ok) throw new Error(`OAuth token exchange failed with HTTP ${res.status}`);
-    const json = await res.json() as { access_token?: string; refresh_token?: string; expires_in?: number };
+    const res = await this.identityRequest(tokenEndpoint, { method: "POST", headers: Object.fromEntries(this.mobileHeaders({ "content-type": "application/x-www-form-urlencoded", accept: "application/json" }).entries()), body: body.toString() });
+    if (res.status < 200 || res.status >= 300) throw new Error(`OAuth token exchange failed with HTTP ${res.status}: ${res.text.replace(/\s+/g, " ").slice(0, 200)}`);
+    const json = JSON.parse(res.text) as { access_token?: string; refresh_token?: string; expires_in?: number };
     if (!json.access_token) throw new Error("OAuth response did not contain an access token");
     this.accessToken = json.access_token;
     this.refreshToken = json.refresh_token;
     this.pendingOAuth = undefined;
     this.pendingCodeVerifier = undefined;
+    this.persistTokens();
     return { authenticated: true, expiresIn: json.expires_in };
   }
 
   async refreshAccessToken(): Promise<boolean> {
+    // Another session may already have rotated the refresh token; prefer the persisted one.
+    const stored = this.readStoredTokens();
+    if (stored?.refresh_token && stored.refresh_token !== this.refreshToken) {
+      this.refreshToken = stored.refresh_token;
+      if (stored.access_token) this.accessToken = stored.access_token;
+    }
     if (!this.refreshToken) return false;
     const discovery = await this.discovery();
     const tokenEndpoint = discovery.token_endpoint ?? "https://identity.alza.cz/connect/token";
@@ -179,12 +232,14 @@ export class MobileApi {
       refresh_token: this.refreshToken,
       ...(MobileApi.clientSecret() ? { client_secret: MobileApi.clientSecret()! } : {}),
     });
-    const res = await fetch(tokenEndpoint, { method: "POST", headers: this.mobileHeaders({ "content-type": "application/x-www-form-urlencoded", accept: "application/json" }), body });
-    if (!res.ok) return false;
-    const json = await res.json() as { access_token?: string; refresh_token?: string };
+    const res = await this.identityRequest(tokenEndpoint, { method: "POST", headers: Object.fromEntries(this.mobileHeaders({ "content-type": "application/x-www-form-urlencoded", accept: "application/json" }).entries()), body: body.toString() });
+    if (res.status < 200 || res.status >= 300) return false;
+    let json: { access_token?: string; refresh_token?: string };
+    try { json = JSON.parse(res.text); } catch { return false; }
     if (!json.access_token) return false;
     this.accessToken = json.access_token;
     this.refreshToken = json.refresh_token ?? this.refreshToken;
+    this.persistTokens();
     return true;
   }
 

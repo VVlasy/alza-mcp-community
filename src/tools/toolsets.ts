@@ -98,10 +98,38 @@ export const TOOLSET_DEFS: ToolsetDef[] = [
   },
 ];
 
+export interface ToolsetPolicy {
+  /** Toolset ids to expose. Undefined = upstream defaults (defaultEnabled). */
+  enabled?: string[];
+  /** When true, tools outside `enabled` are removed and `set_toolset` is not registered. */
+  locked?: boolean;
+  /** Exact tool allowlist. When set, it overrides `enabled`, implies `locked`, and every other tool is removed. */
+  tools?: string[];
+}
+
+/** Reads ALZA_TOOLSETS (comma list) and ALZA_LOCK_TOOLSETS (true/1). */
+export function toolsetPolicyFromEnv(env: NodeJS.ProcessEnv = process.env): ToolsetPolicy {
+  const raw = env.ALZA_TOOLSETS?.trim();
+  const enabled = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+  const known = new Set(TOOLSET_DEFS.map((d) => d.id));
+  for (const id of enabled ?? []) {
+    if (!known.has(id)) throw new Error(`ALZA_TOOLSETS: unknown toolset "${id}" (known: ${[...known].join(", ")})`);
+  }
+  const rawTools = env.ALZA_TOOLS?.trim();
+  const tools = rawTools ? rawTools.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+  if (tools) {
+    const knownTools = new Set(TOOLSET_DEFS.flatMap((d) => d.tools));
+    for (const t of tools) if (!knownTools.has(t)) throw new Error(`ALZA_TOOLS: unknown tool "${t}"`);
+  }
+  const locked = Boolean(tools) || /^(1|true|yes)$/i.test(env.ALZA_LOCK_TOOLSETS ?? "");
+  return { enabled, locked, tools };
+}
+
 export function registerToolsets(
   server: McpServer,
   errorWrap: (name: string, fn: () => Promise<ToolResult>) => Promise<ToolResult>,
-  allTools: RegisterableTool[]
+  allTools: RegisterableTool[],
+  policy: ToolsetPolicy = {}
 ): void {
   const groupByTool = new Map<string, ToolsetDef>();
   for (const def of TOOLSET_DEFS) {
@@ -124,11 +152,26 @@ export function registerToolsets(
   for (const tool of allTools) {
     registered.set(tool.name, tool.register(server, errorWrap));
   }
+  const isOn = (def: ToolsetDef) =>
+    policy.tools ? def.tools.some((t) => policy.tools!.includes(t)) : policy.enabled ? policy.enabled.includes(def.id) : def.defaultEnabled;
+  const toolOn = (name: string, def: ToolsetDef) => (policy.tools ? policy.tools.includes(name) : isOn(def));
   for (const [name, def] of groupByTool) {
-    if (!def.defaultEnabled) registered.get(name)!.disable();
+    if (toolOn(name, def)) {
+      registered.get(name)!.enable();
+      continue;
+    }
+    if (policy.locked) {
+      registered.get(name)!.remove();
+      registered.delete(name);
+    } else {
+      registered.get(name)!.disable();
+    }
   }
 
-  const toolsetIds = TOOLSET_DEFS.map((d) => d.id);
+  const visibleDefs = (policy.locked ? TOOLSET_DEFS.filter(isOn) : TOOLSET_DEFS).map((d) =>
+    policy.tools ? { ...d, tools: d.tools.filter((t) => policy.tools!.includes(t)) } : d
+  );
+  const toolsetIds = visibleDefs.map((d) => d.id);
 
   server.registerTool(
     "list_toolsets",
@@ -154,7 +197,7 @@ export function registerToolsets(
     },
     async () =>
       errorWrap("list_toolsets", async () => {
-        const toolsets = TOOLSET_DEFS.map((def) => ({
+        const toolsets = visibleDefs.map((def) => ({
           id: def.id,
           title: def.title,
           description: def.description,
@@ -168,6 +211,8 @@ export function registerToolsets(
         };
       })
   );
+
+  if (policy.locked) return;
 
   server.registerTool(
     "set_toolset",
